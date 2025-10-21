@@ -1,17 +1,17 @@
-# qr.py — Visitor QR & Badge server + Google Forms webhook + Dashboard with Badge/QR toggle
+# qr.py — Visitor QR & Badge server + Google Forms webhook + Dashboard + Logo uploader + optional WhatsApp proxy
 
 import os, io, sqlite3, string, secrets, base64, mimetypes, json
 from datetime import datetime, date
-from flask import Flask, request, jsonify, send_file, render_template_string, make_response
+from flask import Flask, request, jsonify, send_file, render_template_string, make_response, redirect, url_for, abort
 from PIL import Image, ImageDraw, ImageFont
 import qrcode
 import cv2
 import numpy as np
 from pyzbar import pyzbar
 
-# اختياري: للاتصال بسيرفر واتساب البروكسي إذا مفعّل
+# requests اختياري (لبروكسي واتساب). إذا غير متاح ما راح يتكسر السيرفر
 try:
-    import requests  # تأكدت تضيف requests بالrequirements
+    import requests
 except Exception:
     requests = None
 
@@ -20,25 +20,28 @@ DB_PATH   = os.environ.get("QR_DB", "data/visitors.db").strip()
 GF_SHARED_SECRET = os.environ.get("GF_SHARED_SECRET", "").strip()
 
 # ---------- Badge & font config ----------
-FONT_SIZE        = 48
+FONT_SIZE        = 48               # Times New Roman Bold 48
 LINE_SPACING     = 1.5
 BADGE_W, BADGE_H = 1200, 1800
 BADGE_DPI        = int(os.environ.get("BADGE_DPI", "600"))
 
-# Logo
-LOGO_PATH         = os.environ.get("BADGE_LOGO", "logo.png")  # حط اسم الملف بالـrepo
+# Logo (يوضع في أعلى البورتريت)
+LOGO_PATH         = os.environ.get("BADGE_LOGO", "logo.png")
 LOGO_CM           = float(os.environ.get("BADGE_LOGO_CM", "2.0"))
 HOLE_SAFE_CM      = float(os.environ.get("BADGE_HOLE_SAFE_CM", "0.8"))
 LOGO_SHIFT_UP_CM  = float(os.environ.get("BADGE_LOGO_SHIFT_UP_CM", "0.2"))
 TEXT_TOP_GAP_CM   = float(os.environ.get("BADGE_TEXT_TOP_GAP_CM", "0.7"))
 
-# QR on badge (bottom-centered)
+# QR على أسفل الباج
 QR_CM_DEFAULT = float(os.environ.get("BADGE_QR_CM", "2.4"))
 QR_CM         = QR_CM_DEFAULT
 QR_BORDER     = int(os.environ.get("BADGE_QR_BORDER", "1"))
 
-# اختياري: بروكسي إرسال واتساب كصورة باستخدام التمبلت نفسها
-WA_PROXY_URL  = (os.environ.get("WA_PROXY_URL") or "").strip()  # مثال: https://your-whats-server.onrender.com/send-image
+# بروكسي واتساب (يرسل صورة الباج باستخدام تمبلت واتساب عبر سيرفرك الثاني)
+WA_PROXY_URL      = (os.environ.get("WA_PROXY_URL") or "").strip()
+
+# مفتاح رفع اللوغو (بسيط)
+LOGO_UPLOAD_KEY   = (os.environ.get("LOGO_UPLOAD_KEY") or "").strip()
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024  # 20MB uploads
@@ -144,6 +147,7 @@ def compose_badge_portrait(name, company, position, visitor_id=None, w=BADGE_W, 
     d   = ImageDraw.Draw(img)
     f_label = load_times_bold(FONT_SIZE)
 
+    # مكان اللوغو العلوي (مع حافة ثقب وتعويض خفيف للأعلى)
     safe_top_px   = cm_to_px(HOLE_SAFE_CM)
     logo_shift_px = cm_to_px(LOGO_SHIFT_UP_CM)
     logo_side     = cm_to_px(LOGO_CM)
@@ -153,7 +157,7 @@ def compose_badge_portrait(name, company, position, visitor_id=None, w=BADGE_W, 
     if os.path.exists(LOGO_PATH):
         try:
             logo = Image.open(LOGO_PATH).convert("RGBA")
-            r = logo.width / float(logo.height)
+            r = max(1e-6, logo.width / float(logo.height))
             if r >= 1.0:
                 nw, nh = logo_side, int(round(logo_side / r))
             else:
@@ -165,6 +169,7 @@ def compose_badge_portrait(name, company, position, visitor_id=None, w=BADGE_W, 
         except Exception:
             pass
 
+    # نصوص يسار مع التفاف
     side_pad      = cm_to_px(0.6)
     top_text      = after_logo + cm_to_px(TEXT_TOP_GAP_CM)
     max_text_w    = w - 2*side_pad
@@ -190,6 +195,7 @@ def compose_badge_portrait(name, company, position, visitor_id=None, w=BADGE_W, 
     y += cm_to_px(0.35)
     y += draw_row("Position:", (position or ""), y)
 
+    # QR بالأسفل وسط
     if visitor_id:
         bottom_cm   = float(os.environ.get("BADGE_QR_BOTTOM_CM", "0.8"))
         min_cm      = float(os.environ.get("BADGE_QR_MIN_CM", "1.8"))
@@ -205,12 +211,8 @@ def compose_badge_portrait(name, company, position, visitor_id=None, w=BADGE_W, 
         qr_max     = min(int(w * max_ratio), cm_to_px(max_cm))
 
         qr_side = max(qr_min, min(qr_nominal, qr_max))
-
         available_h = h - bottom_margin - (y + safety_gap)
-        if available_h < qr_min:
-            qr_side = qr_min
-        else:
-            qr_side = min(qr_side, available_h)
+        qr_side = qr_min if available_h < qr_min else min(qr_side, available_h)
 
         qx = (w - qr_side) // 2
         qy = h - bottom_margin - qr_side
@@ -223,7 +225,7 @@ def compose_badge_portrait(name, company, position, visitor_id=None, w=BADGE_W, 
 def make_badge_png(name, company, position, visitor_id=None, rotate_ccw=False):
     img = compose_badge_portrait(name, company, position, visitor_id=visitor_id)
     if rotate_ccw:
-        img = img.transpose(Image.ROTATE_90)  # 90° CCW
+        img = img.transpose(Image.ROTATE_90)  # 90° لليسار (للطابعات اللي تجبر Landscape)
     b = io.BytesIO()
     img.save(b, "PNG")
     b.seek(0)
@@ -277,13 +279,13 @@ def robust_decode(img):
     if t: return t, p
     return "", []
 
-# ---------- HTML (dashboard with toggle) ----------
+# ---------- Dashboard (QR/Badge toggle) ----------
 INDEX_HTML = """
 <!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"/>
 <title>{{title}}</title>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <style>
-:root{ --bg:#ffffff; --fg:#0f141a; --muted:#6b7280; --border:#e5e7eb; --chip:#eef2ff; --chipb:#c7d2fe; --accent:#111827;}
+:root{ --bg:#ffffff; --fg:#0f141a; --muted:#6b7280; --border:#e5e7eb; --accent:#111827;}
 *{box-sizing:border-box}
 body{background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial;margin:0;}
 .wrap{max-width:1100px;margin:28px auto;padding:0 16px;position:relative;}
@@ -378,7 +380,6 @@ def index():
         cur.execute("SELECT COUNT(*) AS c FROM visitors WHERE DATE(substr(created_at,1,10)) = DATE(?)",
                     (date.today().isoformat(),))
         today = cur.fetchone()["c"]
-        # إذا العمود موجود يطلع العدد، وإلا اعتبره 0
         try:
             cur.execute("SELECT COUNT(*) AS c FROM visitors WHERE wa_sent=1")
             wa = cur.fetchone()["c"]
@@ -403,6 +404,38 @@ def ui_logo():
     mime = mimetypes.guess_type(LOGO_PATH)[0] or "image/png"
     return send_file(LOGO_PATH, mimetype=mime)
 
+# ---- Logo uploader (يحفظ اللوغو في BADGE_LOGO) ----
+def _ensure_dir(path):
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+@app.route("/logo/form")
+def logo_form():
+    if LOGO_UPLOAD_KEY and (request.args.get("key") or "") != LOGO_UPLOAD_KEY:
+        return "Forbidden", 403
+    return f"""
+<!doctype html><meta charset="utf-8"/>
+<h3>Upload Badge Logo → {LOGO_PATH}</h3>
+<form method="POST" action="/logo/upload?key={LOGO_UPLOAD_KEY}" enctype="multipart/form-data">
+  <input type="file" name="file" accept="image/*" required/>
+  <button type="submit">Upload</button>
+</form>
+<p>Current: <img src="/ui_logo?ts={int(datetime.utcnow().timestamp())}" style="max-height:80px"/></p>
+"""
+
+@app.route("/logo/upload", methods=["POST"])
+def logo_upload():
+    if LOGO_UPLOAD_KEY and (request.args.get("key") or "") != LOGO_UPLOAD_KEY:
+        return "Forbidden", 403
+    if "file" not in request.files:
+        return "No file", 400
+    f = request.files["file"]
+    _ensure_dir(LOGO_PATH)
+    f.save(LOGO_PATH)
+    return redirect(url_for("logo_form", key=LOGO_UPLOAD_KEY))
+
+# ---- Create from simple form/api ----
 @app.route("/create", methods=["POST"])
 def create():
     ensure_db()
@@ -533,11 +566,11 @@ def forms_google():
             rec = dict(id=vid, name=name, company=company, position=position,
                        email=email, phone=phone, pin=pin, created_at=datetime.utcnow().isoformat())
 
-    # توليد صورة QR وبطاقـة
+    # جهّز صور QR & Badge
     qr_buf   = make_qr_png(rec["id"], label_name=rec["name"])
     card_buf = make_badge_png(rec["name"], rec["company"], rec["position"], visitor_id=rec["id"], rotate_ccw=False)
 
-    # إرسال واتساب عبر بروكسي (اختياري)
+    # إرسال واتساب (اختياري)
     wa_result = None
     if WA_PROXY_URL and requests is not None:
         try:
@@ -546,29 +579,28 @@ def forms_google():
             r = requests.post(WA_PROXY_URL, files=files, data=data, timeout=60)
             if r.ok:
                 wa_result = {"ok": True}
-                with sqlite3.connect(DB_PATH) as con:
-                    con.execute("UPDATE visitors SET wa_sent=1, wa_ts=? WHERE id=?",
-                                (datetime.utcnow().isoformat(), rec["id"]))
-                    con.commit()
+                with sqlite3.connect(DB_PATH) as con2:
+                    con2.execute("UPDATE visitors SET wa_sent=1, wa_ts=? WHERE id=?",
+                                 (datetime.utcnow().isoformat(), rec["id"]))
+                    con2.commit()
             else:
                 wa_result = {"ok": False, "code": r.status_code, "text": r.text}
         except Exception as e:
             wa_result = {"ok": False, "error": str(e)}
 
     base = request.host_url.rstrip("/")
-    qr_url = f"{base}/qr/{rec['id']}.png"
-    dl_url = f"{qr_url}?dl=1"
-    card   = f"{base}/card/{rec['id']}.png"
-    card_l = f"{base}/card_landscape/{rec['id']}.png"
-
-    out = dict(ok=True, id=rec["id"], name=rec["name"],
-               qr=qr_url, qr_download=dl_url,
-               card_portrait=card, card_landscape=card_l)
+    out = dict(
+        ok=True, id=rec["id"], name=rec["name"],
+        qr=f"{base}/qr/{rec['id']}.png",
+        qr_download=f"{base}/qr/{rec['id']}.png?dl=1",
+        card_portrait=f"{base}/card/{rec['id']}.png",
+        card_landscape=f"{base}/card_landscape/{rec['id']}.png"
+    )
     if wa_result is not None:
         out["whatsapp"] = {"mode": "proxy", **wa_result}
     return corsify(jsonify(out))
 
-# ---- Badge decode & helpers (تبقى كما هي) ----
+# ---- Decode helpers (تبقى كما هي) ----
 @app.route("/decode_badge", methods=["GET"])
 @app.route("/decode_badge/", methods=["GET"])
 @app.route("/decode_badge/<path:_extra>", methods=["GET"])
