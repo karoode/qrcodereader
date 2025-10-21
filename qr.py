@@ -1,5 +1,4 @@
 # qr.py — Visitor QR & Badge server + Google Forms webhook
-# Portrait badge (Times New Roman Bold 48, 1.5 line spacing, left alignment, wrap long values)
 
 import os, io, sqlite3, string, secrets, base64, mimetypes, json
 from datetime import datetime
@@ -11,10 +10,7 @@ import numpy as np
 from pyzbar import pyzbar
 
 APP_TITLE = "Visitor QR"
-# استخدم مجلد data الافتراضي (يُنشأ تلقائياً)
-DB_PATH   = os.environ.get("QR_DB", "data/visitors.db")
-
-# Google Forms secret (ضبطه من Render → Environment)
+DB_PATH   = os.environ.get("QR_DB", "data/visitors.db")  # مجلد ثابت وسهل عمله
 GF_SHARED_SECRET = os.environ.get("GF_SHARED_SECRET", "").strip()
 
 # ---------- Badge & font config ----------
@@ -40,7 +36,6 @@ app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024  # 20MB uploads
 
 # ---------- DB helpers ----------
 def ensure_db():
-    # أنشئ المجلد إذا كان المسار يحتوي مجلد
     db_dir = os.path.dirname(DB_PATH)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
@@ -138,7 +133,6 @@ def compose_badge_portrait(name, company, position, visitor_id=None, w=BADGE_W, 
     d   = ImageDraw.Draw(img)
     f_label = load_times_bold(FONT_SIZE)
 
-    # Logo أعلى — مرفوع
     safe_top_px   = cm_to_px(HOLE_SAFE_CM)
     logo_shift_px = cm_to_px(LOGO_SHIFT_UP_CM)
     logo_side     = cm_to_px(LOGO_CM)
@@ -160,7 +154,6 @@ def compose_badge_portrait(name, company, position, visitor_id=None, w=BADGE_W, 
         except Exception:
             pass
 
-    # نص يسار + التفاف
     side_pad      = cm_to_px(0.6)
     top_text      = after_logo + cm_to_px(TEXT_TOP_GAP_CM)
     max_text_w    = w - 2*side_pad
@@ -186,7 +179,6 @@ def compose_badge_portrait(name, company, position, visitor_id=None, w=BADGE_W, 
     y += cm_to_px(0.35)
     y += draw_row("Position:", (position or ""), y)
 
-    # QR أسفل البطاقة
     if visitor_id:
         bottom_cm   = float(os.environ.get("BADGE_QR_BOTTOM_CM", "0.8"))
         min_cm      = float(os.environ.get("BADGE_QR_MIN_CM", "1.8"))
@@ -218,7 +210,7 @@ def compose_badge_portrait(name, company, position, visitor_id=None, w=BADGE_W, 
     return img
 
 def make_badge_png(name, company, position, visitor_id=None, rotate_ccw=False):
-    img = compose_badge_portrait(name, company, position, visitor_id=visitor_id)
+    img = compose_badge_portrait(name, company, position, visitor_id=vid)
     if rotate_ccw:
         img = img.transpose(Image.ROTATE_90)  # 90° CCW
     b = io.BytesIO()
@@ -399,21 +391,17 @@ def qr_png(vid):
     return send_file(bio, mimetype="image/png")
 
 # ---------- Google Forms webhook ----------
-# يستقبل JSON من Apps Script ويُرجع روابط QR/Badge
 @app.route("/forms/google", methods=["POST", "OPTIONS"])
 def forms_google():
     if request.method == "OPTIONS":
         return corsify(make_response(("", 204)))
 
-    # تحقق السر من الهيدر X-Secret أو من الحقل "secret"
     incoming_secret = (request.headers.get("X-Secret") or
                        (request.form.get("secret") if request.form else "") or
                        (request.json.get("secret") if request.is_json and request.json else "") or "").strip()
     if GF_SHARED_SECRET and incoming_secret != GF_SHARED_SECRET:
         return corsify(jsonify(ok=False, error="unauthorized")), 401
 
-    # يدعم payload من نوع Apps Script: e.namedValues أو body بسيط
-    data = {}
     if request.is_json:
         data = request.get_json(silent=True) or {}
         if "namedValues" in data and isinstance(data["namedValues"], dict):
@@ -431,12 +419,11 @@ def forms_google():
     else:
         data = request.form.to_dict(flat=True)
 
-    # محاولات أسماء شائعة للحقل
-    name     = pick(data, "name", "Name", "الاسم", "full_name", "Full Name")
-    company  = pick(data, "company", "Company", "الشركة")
-    position = pick(data, "position", "Position", "المنصب")
-    email    = (pick(data, "email", "Email", "البريد") or "").lower()
-    phone    = pick(data, "phone", "Phone", "الهاتف")
+    name     = (pick(data, "name", "Name", "الاسم", "full_name", "Full Name") or "").strip()
+    company  = (pick(data, "company", "Company", "الشركة") or "").strip()
+    position = (pick(data, "position", "Position", "المنصب") or "").strip()
+    email    = (pick(data, "email", "Email", "البريد") or "").strip().lower()
+    phone    = (pick(data, "phone", "Phone", "الهاتف") or "").strip()
 
     if not all([name, company, position, email, phone]):
         return corsify(jsonify(ok=False, error="missing_fields",
@@ -459,18 +446,18 @@ def forms_google():
             rec = dict(id=vid, name=name, company=company, position=position,
                        email=email, phone=phone, pin=pin, created_at=datetime.utcnow().isoformat())
 
-    # روابط مفيدة
     base = request.host_url.rstrip("/")
     qr_url = f"{base}/qr/{rec['id']}.png"
     dl_url = f"{qr_url}?dl=1"
     card   = f"{base}/card/{rec['id']}.png"
     card_l = f"{base}/card_landscape/{rec['id']}.png"
 
-    return corsify(jsonify(ok=True, id=rec["id"], name=rec["name"],
-                           qr=qr_url, qr_download=dl_url,
-                           card_portrait=card, card_landscape=card_l)))
+    return corsify(jsonify(
+        ok=True, id=rec["id"], name=rec["name"],
+        qr=qr_url, qr_download=dl_url,
+        card_portrait=card, card_landscape=card_l
+    ))
 
-# ---- remaining routes (badge, health, decode) ----
 @app.route("/card/<vid>.png")
 def card_png(vid):
     ensure_db()
