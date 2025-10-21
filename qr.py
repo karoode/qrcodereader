@@ -1,15 +1,19 @@
-# qr.py — Visitor QR & Badge server + Google Forms webhook + Dashboard + Logo uploader + optional WhatsApp proxy
+# qr.py — Visitor QR & Badge server + Google Forms webhook + Dashboard + Logo & Font upload
+# التعديلات:
+# - إرسال واتساب: يرسل صورة QR فقط (مو الباج)
+# - زيادة حجم الخط إلى 64 وتفعيل استخدام خط مخصص عبر BADGE_FONT_PATH
+# - صفحات رفع للّوغو والخط إلى الديسك (Render)
 
 import os, io, sqlite3, string, secrets, base64, mimetypes, json
 from datetime import datetime, date
-from flask import Flask, request, jsonify, send_file, render_template_string, make_response, redirect, url_for, abort
+from flask import Flask, request, jsonify, send_file, render_template_string, make_response, redirect, url_for
 from PIL import Image, ImageDraw, ImageFont
 import qrcode
 import cv2
 import numpy as np
 from pyzbar import pyzbar
 
-# requests اختياري (لبروكسي واتساب). إذا غير متاح ما راح يتكسر السيرفر
+# اختياري: requests للبروكسي
 try:
     import requests
 except Exception:
@@ -20,40 +24,42 @@ DB_PATH   = os.environ.get("QR_DB", "data/visitors.db").strip()
 GF_SHARED_SECRET = os.environ.get("GF_SHARED_SECRET", "").strip()
 
 # ---------- Badge & font config ----------
-FONT_SIZE        = 48               # Times New Roman Bold 48
+FONT_SIZE        = int(os.environ.get("BADGE_FONT_SIZE", "64"))  # <-- كبرنا الحجم إلى 64
 LINE_SPACING     = 1.5
 BADGE_W, BADGE_H = 1200, 1800
 BADGE_DPI        = int(os.environ.get("BADGE_DPI", "600"))
 
-# Logo (يوضع في أعلى البورتريت)
+# Logo
 LOGO_PATH         = os.environ.get("BADGE_LOGO", "logo.png")
 LOGO_CM           = float(os.environ.get("BADGE_LOGO_CM", "2.0"))
 HOLE_SAFE_CM      = float(os.environ.get("BADGE_HOLE_SAFE_CM", "0.8"))
 LOGO_SHIFT_UP_CM  = float(os.environ.get("BADGE_LOGO_SHIFT_UP_CM", "0.2"))
 TEXT_TOP_GAP_CM   = float(os.environ.get("BADGE_TEXT_TOP_GAP_CM", "0.7"))
 
-# QR على أسفل الباج
+# QR على الباج
 QR_CM_DEFAULT = float(os.environ.get("BADGE_QR_CM", "2.4"))
 QR_CM         = QR_CM_DEFAULT
 QR_BORDER     = int(os.environ.get("BADGE_QR_BORDER", "1"))
 
-# بروكسي واتساب (يرسل صورة الباج باستخدام تمبلت واتساب عبر سيرفرك الثاني)
+# واتساب بروكسي (يرسل صورة)
 WA_PROXY_URL      = (os.environ.get("WA_PROXY_URL") or "").strip()
 
-# مفتاح رفع اللوغو (بسيط)
+# مفاتيح آمنة مبسطة للرفع
 LOGO_UPLOAD_KEY   = (os.environ.get("LOGO_UPLOAD_KEY") or "").strip()
+FONT_UPLOAD_KEY   = (os.environ.get("FONT_UPLOAD_KEY") or LOGO_UPLOAD_KEY).strip()
+
+# مسار الخط المخصص (ينصح: /app/data/timesbd.ttf على Render)
+BADGE_FONT_PATH   = (os.environ.get("BADGE_FONT_PATH") or "").strip()
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024  # 20MB uploads
+app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024  # 20MB
 
-# ---------- DB helpers ----------
+# ---------- DB ----------
 def ensure_db():
-    db_dir = os.path.dirname(DB_PATH)
-    if db_dir:
-        os.makedirs(db_dir, exist_ok=True)
+    d = os.path.dirname(DB_PATH)
+    if d: os.makedirs(d, exist_ok=True)
     with sqlite3.connect(DB_PATH) as con:
-        cur = con.cursor()
-        cur.execute("""
+        con.execute("""
             CREATE TABLE IF NOT EXISTS visitors(
               id TEXT PRIMARY KEY,
               name TEXT NOT NULL,
@@ -73,60 +79,54 @@ def rand_token(prefix="ajz_", n=10):
     a = string.ascii_lowercase + string.digits
     return prefix + "".join(secrets.choice(a) for _ in range(n))
 
-def rand_pin():
-    return f"{secrets.randbelow(10000):04d}"
+def rand_pin(): return f"{secrets.randbelow(10000):04d}"
 
-# ---------- Fonts / drawing ----------
+# ---------- Fonts ----------
 def load_times_bold(size=FONT_SIZE):
+    # يفضّل الملف المخصص إذا موجود
+    if BADGE_FONT_PATH and os.path.exists(BADGE_FONT_PATH):
+        try: return ImageFont.truetype(BADGE_FONT_PATH, size=size)
+        except Exception: pass
+    # مسارات شائعة لـ Times New Roman Bold
     candidates = [
         "/Library/Fonts/Times New Roman Bold.ttf",
         "C:/Windows/Fonts/timesbd.ttf",
         "/usr/share/fonts/truetype/msttcorefonts/Times_New_Roman_Bold.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSerifBold.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
     ]
-    envp = os.environ.get("BADGE_FONT_PATH")
-    if envp: candidates.insert(0, envp)
     for p in candidates:
         if os.path.exists(p):
-            try:
-                return ImageFont.truetype(p, size=size)
-            except Exception:
-                pass
+            try: return ImageFont.truetype(p, size=size)
+            except Exception: pass
     return ImageFont.load_default()
 
 def text_size(draw, text, font):
     if not text: return (0,0)
-    l, t, r, b = draw.textbbox((0,0), text, font=font)
+    l,t,r,b = draw.textbbox((0,0), text, font=font)
     return r-l, b-t
 
-def cm_to_px(cm, dpi=BADGE_DPI):
-    return int(round((cm / 2.54) * dpi))
+def cm_to_px(cm, dpi=BADGE_DPI): return int(round((cm/2.54)*dpi))
 
 def wrap_lines(draw, text, font, max_w):
     text = (text or "").strip()
-    if not text:
-        return [""]
+    if not text: return [""]
     words = text.split()
     lines, cur = [], ""
     for w in words:
-        cand = (cur + " " + w).strip()
+        cand = (cur+" "+w).strip()
         if text_size(draw, cand, font)[0] <= max_w or not cur:
             cur = cand
         else:
-            lines.append(cur)
-            cur = w
+            lines.append(cur); cur = w
     if cur: lines.append(cur)
     return lines
 
-# ---------- QR helpers ----------
+# ---------- QR ----------
 def build_qr_image(visitor_id, size_px):
-    qr = qrcode.QRCode(version=None,
-                       error_correction=qrcode.constants.ERROR_CORRECT_M,
+    qr = qrcode.QRCode(version=None, error_correction=qrcode.constants.ERROR_CORRECT_M,
                        box_size=10, border=QR_BORDER)
-    qr.add_data(visitor_id)
-    qr.make(fit=True)
+    qr.add_data(visitor_id); qr.make(fit=True)
     img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
     return img.resize((size_px, size_px), Image.NEAREST)
 
@@ -134,20 +134,19 @@ def make_qr_png(visitor_id, label_name=None, size=1024):
     qr_img = build_qr_image(visitor_id, size)
     if not label_name:
         b = io.BytesIO(); qr_img.save(b, "PNG"); b.seek(0); return b
-    canvas = Image.new("RGB", (size, size + 160), "white")
-    canvas.paste(qr_img, (0,0))
+    canvas = Image.new("RGB", (size, size+160), "white")
+    canvas.paste(qr_img,(0,0))
     d = ImageDraw.Draw(canvas); f = load_times_bold(FONT_SIZE)
     tw, th = text_size(d, label_name, f)
-    d.text(((size - tw)//2, size + (160 - th)//2), label_name, font=f, fill=(15,15,15))
-    b = io.BytesIO(); canvas.save(b, "PNG"); b.seek(0); return b
+    d.text(((size-tw)//2, size+(160-th)//2), label_name, font=f, fill=(15,15,15))
+    b = io.BytesIO(); canvas.save(b,"PNG"); b.seek(0); return b
 
-# ---------- Badge compose ----------
+# ---------- Badge ----------
 def compose_badge_portrait(name, company, position, visitor_id=None, w=BADGE_W, h=BADGE_H):
-    img = Image.new("RGB", (w, h), (255, 255, 255))
+    img = Image.new("RGB",(w,h),(255,255,255))
     d   = ImageDraw.Draw(img)
     f_label = load_times_bold(FONT_SIZE)
 
-    # مكان اللوغو العلوي (مع حافة ثقب وتعويض خفيف للأعلى)
     safe_top_px   = cm_to_px(HOLE_SAFE_CM)
     logo_shift_px = cm_to_px(LOGO_SHIFT_UP_CM)
     logo_side     = cm_to_px(LOGO_CM)
@@ -157,81 +156,64 @@ def compose_badge_portrait(name, company, position, visitor_id=None, w=BADGE_W, 
     if os.path.exists(LOGO_PATH):
         try:
             logo = Image.open(LOGO_PATH).convert("RGBA")
-            r = max(1e-6, logo.width / float(logo.height))
-            if r >= 1.0:
-                nw, nh = logo_side, int(round(logo_side / r))
-            else:
-                nh, nw = logo_side, int(round(logo_side * r))
-            logo = logo.resize((nw, nh), Image.LANCZOS)
-            lx = (w - nw)//2
-            img.paste(logo, (lx, y_logo), logo)
-            after_logo = y_logo + nh
-        except Exception:
-            pass
+            r = max(1e-6, logo.width/float(logo.height))
+            if r>=1.0: nw,nh = logo_side, int(round(logo_side/r))
+            else:      nh,nw = logo_side, int(round(logo_side*r))
+            logo = logo.resize((nw,nh), Image.LANCZOS)
+            lx = (w-nw)//2
+            img.paste(logo,(lx,y_logo),logo)
+            after_logo = y_logo+nh
+        except Exception: pass
 
-    # نصوص يسار مع التفاف
     side_pad      = cm_to_px(0.6)
     top_text      = after_logo + cm_to_px(TEXT_TOP_GAP_CM)
     max_text_w    = w - 2*side_pad
     gap_label_val = cm_to_px(0.6)
     labels        = ["Name:", "Company:", "Position:"]
-    lw_max        = max(text_size(d, lbl, f_label)[0] for lbl in labels)
+    lw_max        = max(text_size(d,lbl,f_label)[0] for lbl in labels)
     value_x       = side_pad + lw_max + gap_label_val
     value_w       = max_text_w - lw_max - gap_label_val
     line_h        = int(round(LINE_SPACING * FONT_SIZE))
 
-    def draw_row(label, value, y_top):
-        d.text((side_pad, y_top), label, font=f_label, fill=(10,10,10))
-        lines = wrap_lines(d, value, f_label, value_w)
-        for i, ln in enumerate(lines):
-            d.text((value_x, y_top + i*line_h), ln, font=f_label, fill=(10,10,10))
-        used_h = max(line_h, line_h * len(lines))
-        return used_h
+    def row(label, value, y_top):
+        d.text((side_pad,y_top), label, font=f_label, fill=(10,10,10))
+        for i,ln in enumerate(wrap_lines(d,value,f_label,value_w)):
+            d.text((value_x, y_top+i*line_h), ln, font=f_label, fill=(10,10,10))
+        return max(line_h, line_h*len(wrap_lines(d,value,f_label,value_w)))
 
     y = top_text
-    y += draw_row("Name:",     (name or ""),     y)
-    y += cm_to_px(0.35)
-    y += draw_row("Company:",  (company or ""),  y)
-    y += cm_to_px(0.35)
-    y += draw_row("Position:", (position or ""), y)
+    y += row("Name:",     (name or ""),     y); y += cm_to_px(0.35)
+    y += row("Company:",  (company or ""),  y); y += cm_to_px(0.35)
+    y += row("Position:", (position or ""), y)
 
-    # QR بالأسفل وسط
     if visitor_id:
-        bottom_cm   = float(os.environ.get("BADGE_QR_BOTTOM_CM", "0.8"))
-        min_cm      = float(os.environ.get("BADGE_QR_MIN_CM", "1.8"))
-        max_cm      = float(os.environ.get("BADGE_QR_MAX_CM", "4.0"))
-        max_ratio   = float(os.environ.get("BADGE_QR_MAX_RATIO", "0.28"))
-        safety_cm   = float(os.environ.get("BADGE_QR_SAFETY_CM", "1.6"))
+        bottom_cm   = float(os.environ.get("BADGE_QR_BOTTOM_CM","0.8"))
+        min_cm      = float(os.environ.get("BADGE_QR_MIN_CM","1.8"))
+        max_cm      = float(os.environ.get("BADGE_QR_MAX_CM","4.0"))
+        max_ratio   = float(os.environ.get("BADGE_QR_MAX_RATIO","0.28"))
+        safety_cm   = float(os.environ.get("BADGE_QR_SAFETY_CM","1.6"))
 
         bottom_margin = cm_to_px(bottom_cm)
         safety_gap    = cm_to_px(safety_cm)
+        qr_nominal    = cm_to_px(QR_CM)
+        qr_min        = cm_to_px(min_cm)
+        qr_max        = min(int(w*max_ratio), cm_to_px(max_cm))
+        qr_side       = max(qr_min, min(qr_nominal, qr_max))
+        available_h   = h - bottom_margin - (y + safety_gap)
+        qr_side       = qr_min if available_h < qr_min else min(qr_side, available_h)
 
-        qr_nominal = cm_to_px(QR_CM)
-        qr_min     = cm_to_px(min_cm)
-        qr_max     = min(int(w * max_ratio), cm_to_px(max_cm))
-
-        qr_side = max(qr_min, min(qr_nominal, qr_max))
-        available_h = h - bottom_margin - (y + safety_gap)
-        qr_side = qr_min if available_h < qr_min else min(qr_side, available_h)
-
-        qx = (w - qr_side) // 2
+        qx = (w-qr_side)//2
         qy = h - bottom_margin - qr_side
-
-        qr_img = build_qr_image(visitor_id, qr_side)
-        img.paste(qr_img, (qx, qy))
+        img.paste(build_qr_image(visitor_id, qr_side),(qx,qy))
 
     return img
 
 def make_badge_png(name, company, position, visitor_id=None, rotate_ccw=False):
-    img = compose_badge_portrait(name, company, position, visitor_id=visitor_id)
-    if rotate_ccw:
-        img = img.transpose(Image.ROTATE_90)  # 90° لليسار (للطابعات اللي تجبر Landscape)
-    b = io.BytesIO()
-    img.save(b, "PNG")
-    b.seek(0)
-    return b
+    img = compose_badge_portrait(name, company, position, visitor_id)
+    if rotate_ccw: img = img.transpose(Image.ROTATE_90)
+    b = io.BytesIO(); img.save(b,"PNG"); b.seek(0); return b
 
-# ---------- Robust QR decode ----------
+# ---------- Decode ----------
 def decode_pyzbar(img_bgr):
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     res  = pyzbar.decode(gray)
@@ -241,49 +223,39 @@ def decode_pyzbar(img_bgr):
     if b.polygon and len(b.polygon)>=4:
         poly = [[float(p.x), float(p.y)] for p in b.polygon]
     else:
-        x,y,w,h = b.rect
-        poly = [[x,y],[x+w,y],[x+w,y+h],[x,y+h]]
+        x,y,w,h = b.rect; poly = [[x,y],[x+w,y],[x+w,y+h],[x,y+h]]
     return txt, poly
 
 def preprocess_contrast(img): return cv2.convertScaleAbs(img, alpha=1.35, beta=8)
 
 def robust_decode(img):
-    h, w = img.shape[:2]
-    if max(w, h) < 800:
-        s = 800.0 / max(w, h)
-        img = cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
-    elif max(w, h) > 2000:
-        s = 2000.0 / max(w, h)
-        img = cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
-
-    t, p = decode_pyzbar(img)
-    if t: return t, p
-
+    h,w = img.shape[:2]
+    if max(w,h)<800:
+        s = 800.0/max(w,h); img = cv2.resize(img,None,fx=s,fy=s,interpolation=cv2.INTER_CUBIC)
+    elif max(w,h)>2000:
+        s = 2000.0/max(w,h); img = cv2.resize(img,None,fx=s,fy=s,interpolation=cv2.INTER_AREA)
+    t,p = decode_pyzbar(img)
+    if t: return t,p
     boosted = preprocess_contrast(img)
-    t, p = decode_pyzbar(boosted)
-    if t: return t, p
-
+    t,p = decode_pyzbar(boosted)
+    if t: return t,p
     for k in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_180, cv2.ROTATE_90_COUNTERCLOCKWISE]:
-        rot = cv2.rotate(boosted, k)
-        t, p = decode_pyzbar(rot)
-        if t: return t, p
-
+        t,p = decode_pyzbar(cv2.rotate(boosted,k))
+        if t: return t,p
     g = cv2.cvtColor(boosted, cv2.COLOR_BGR2GRAY)
-    g = cv2.medianBlur(g, 3)
-    thr = cv2.adaptiveThreshold(g,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                cv2.THRESH_BINARY,31,5)
-    t, p = decode_pyzbar(cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR))
-    if t: return t, p
+    g = cv2.medianBlur(g,3)
+    thr = cv2.adaptiveThreshold(g,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY,31,5)
+    t,p = decode_pyzbar(cv2.cvtColor(thr,cv2.COLOR_GRAY2BGR))
+    if t: return t,p
     inv = cv2.bitwise_not(thr)
-    t, p = decode_pyzbar(cv2.cvtColor(inv, cv2.COLOR_GRAY2BGR))
-    if t: return t, p
+    t,p = decode_pyzbar(cv2.cvtColor(inv,cv2.COLOR_GRAY2BGR))
+    if t: return t,p
     return "", []
 
-# ---------- Dashboard (QR/Badge toggle) ----------
+# ---------- Dashboard ----------
 INDEX_HTML = """
 <!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"/>
-<title>{{title}}</title>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>{{title}}</title><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <style>
 :root{ --bg:#ffffff; --fg:#0f141a; --muted:#6b7280; --border:#e5e7eb; --accent:#111827;}
 *{box-sizing:border-box}
@@ -303,18 +275,15 @@ h1{margin:0 0 18px 0; padding-inline-start:140px;}
 .btn.active{border-color:#111827}
 .name{font-weight:800;margin-top:2px}
 .sub{font-size:12px;color:var(--muted)}
-</style>
-</head><body>
+</style></head><body>
 <div class="wrap">
   <img class="logo-fixed" src="/ui_logo" alt="logo"/>
   <h1>{{title}}</h1>
-
   <div class="grid">
     <div class="card"><div class="muted">إجمالي الطلبات</div><div class="kpi">{{kpis.total}}</div></div>
     <div class="card"><div class="muted">طلبات اليوم</div><div class="kpi">{{kpis.today}}</div></div>
     <div class="card"><div class="muted">إرسال واتساب</div><div class="kpi">{{kpis.wa}}</div></div>
   </div>
-
   <div class="cards">
     {% for v in last %}
     <div class="vcard">
@@ -332,23 +301,10 @@ h1{margin:0 0 18px 0; padding-inline-start:140px;}
     {% endfor %}
   </div>
 </div>
-
 <script>
-function activate(btn){ 
-  const p = btn.parentElement.querySelectorAll('.btn'); 
-  p.forEach(b=>b.classList.remove('active')); 
-  btn.classList.add('active');
-}
-function showQR(id, btn){
-  const img = document.getElementById('img_'+id);
-  img.src = img.dataset.qr;
-  activate(btn);
-}
-function showBadge(id, btn){
-  const img = document.getElementById('img_'+id);
-  img.src = img.dataset.badge;
-  activate(btn);
-}
+function activate(btn){ const p = btn.parentElement.querySelectorAll('.btn'); p.forEach(b=>b.classList.remove('active')); btn.classList.add('active'); }
+function showQR(id, btn){  const img=document.getElementById('img_'+id); img.src=img.dataset.qr;    activate(btn); }
+function showBadge(id, btn){const img=document.getElementById('img_'+id); img.src=img.dataset.badge; activate(btn); }
 </script>
 </body></html>
 """
@@ -361,81 +317,80 @@ def corsify(resp):
     h["Access-Control-Allow-Headers"] = "Content-Type, X-Secret"
     return resp
 
-def pick(d, *keys):
+def pick(d,*keys):
     for k in keys:
-        if not k: continue
-        if k in d and d[k]: return d[k]
+        if k and k in d and d[k]: return d[k]
     return ""
+
+def _ensure_dir(path):
+    d = os.path.dirname(path)
+    if d: os.makedirs(d, exist_ok=True)
 
 # ---------- Routes ----------
 @app.route("/")
 def index():
     ensure_db()
-    # KPIs
     with sqlite3.connect(DB_PATH) as con:
         con.row_factory = sqlite3.Row
         cur = con.cursor()
-        cur.execute("SELECT COUNT(*) AS c FROM visitors")
-        total = cur.fetchone()["c"]
-        cur.execute("SELECT COUNT(*) AS c FROM visitors WHERE DATE(substr(created_at,1,10)) = DATE(?)",
-                    (date.today().isoformat(),))
+        cur.execute("SELECT COUNT(*) AS c FROM visitors"); total = cur.fetchone()["c"]
+        cur.execute("SELECT COUNT(*) AS c FROM visitors WHERE DATE(substr(created_at,1,10)) = DATE(?)",(date.today().isoformat(),))
         today = cur.fetchone()["c"]
         try:
-            cur.execute("SELECT COUNT(*) AS c FROM visitors WHERE wa_sent=1")
-            wa = cur.fetchone()["c"]
-        except Exception:
-            wa = 0
+            cur.execute("SELECT COUNT(*) AS c FROM visitors WHERE wa_sent=1"); wa = cur.fetchone()["c"]
+        except Exception: wa = 0
         cur.execute("SELECT id,name,company,position,created_at FROM visitors ORDER BY datetime(created_at) DESC LIMIT 12")
         last = [dict(r) for r in cur.fetchall()]
-
-    return render_template_string(
-        INDEX_HTML,
-        title=APP_TITLE,
-        kpis=dict(total=total, today=today, wa=wa),
-        last=last
-    )
+    return render_template_string(INDEX_HTML, title=APP_TITLE, kpis=dict(total=total,today=today,wa=wa), last=last)
 
 @app.route("/ui_logo")
 def ui_logo():
     if not os.path.exists(LOGO_PATH):
-        img = Image.new("RGB", (160,40), "white")
-        buf = io.BytesIO(); img.save(buf, "PNG"); buf.seek(0)
-        return send_file(buf, mimetype="image/png")
-    mime = mimetypes.guess_type(LOGO_PATH)[0] or "image/png"
-    return send_file(LOGO_PATH, mimetype=mime)
+        img = Image.new("RGB",(160,40),"white")
+        b = io.BytesIO(); img.save(b,"PNG"); b.seek(0); return send_file(b, mimetype="image/png")
+    return send_file(LOGO_PATH, mimetype=(mimetypes.guess_type(LOGO_PATH)[0] or "image/png"))
 
-# ---- Logo uploader (يحفظ اللوغو في BADGE_LOGO) ----
-def _ensure_dir(path):
-    d = os.path.dirname(path)
-    if d:
-        os.makedirs(d, exist_ok=True)
-
+# --- Logo upload
 @app.route("/logo/form")
 def logo_form():
-    if LOGO_UPLOAD_KEY and (request.args.get("key") or "") != LOGO_UPLOAD_KEY:
-        return "Forbidden", 403
-    return f"""
-<!doctype html><meta charset="utf-8"/>
+    if LOGO_UPLOAD_KEY and (request.args.get("key") or "") != LOGO_UPLOAD_KEY: return "Forbidden", 403
+    return f"""<!doctype html><meta charset="utf-8"/>
 <h3>Upload Badge Logo → {LOGO_PATH}</h3>
 <form method="POST" action="/logo/upload?key={LOGO_UPLOAD_KEY}" enctype="multipart/form-data">
   <input type="file" name="file" accept="image/*" required/>
   <button type="submit">Upload</button>
 </form>
-<p>Current: <img src="/ui_logo?ts={int(datetime.utcnow().timestamp())}" style="max-height:80px"/></p>
-"""
+<p>Current: <img src="/ui_logo?ts={int(datetime.utcnow().timestamp())}" style="max-height:80px"/></p>"""
 
 @app.route("/logo/upload", methods=["POST"])
 def logo_upload():
-    if LOGO_UPLOAD_KEY and (request.args.get("key") or "") != LOGO_UPLOAD_KEY:
-        return "Forbidden", 403
-    if "file" not in request.files:
-        return "No file", 400
-    f = request.files["file"]
-    _ensure_dir(LOGO_PATH)
-    f.save(LOGO_PATH)
+    if LOGO_UPLOAD_KEY and (request.args.get("key") or "") != LOGO_UPLOAD_KEY: return "Forbidden", 403
+    if "file" not in request.files: return "No file", 400
+    f = request.files["file"]; _ensure_dir(LOGO_PATH); f.save(LOGO_PATH)
     return redirect(url_for("logo_form", key=LOGO_UPLOAD_KEY))
 
-# ---- Create from simple form/api ----
+# --- Font upload (يحفظ في BADGE_FONT_PATH)
+@app.route("/font/form")
+def font_form():
+    if FONT_UPLOAD_KEY and (request.args.get("key") or "") != FONT_UPLOAD_KEY: return "Forbidden", 403
+    target = BADGE_FONT_PATH or "/app/data/timesbd.ttf"
+    return f"""<!doctype html><meta charset="utf-8"/>
+<h3>Upload Badge Font (TTF/OTF) → {target}</h3>
+<form method="POST" action="/font/upload?key={FONT_UPLOAD_KEY}" enctype="multipart/form-data">
+  <input type="file" name="file" accept=".ttf,.otf,font/ttf,font/otf" required/>
+  <button type="submit">Upload</button>
+</form>
+<p>Set env BADGE_FONT_PATH to: {target}</p>"""
+
+@app.route("/font/upload", methods=["POST"])
+def font_upload():
+    if FONT_UPLOAD_KEY and (request.args.get("key") or "") != FONT_UPLOAD_KEY: return "Forbidden", 403
+    target = BADGE_FONT_PATH or "/app/data/timesbd.ttf"
+    if "file" not in request.files: return "No file", 400
+    f = request.files["file"]; _ensure_dir(target); f.save(target)
+    return f"Saved font to {target}. Set BADGE_FONT_PATH and redeploy."
+
+# --- Simple create
 @app.route("/create", methods=["POST"])
 def create():
     ensure_db()
@@ -445,8 +400,7 @@ def create():
     position = (f.get("position") or "").strip()
     email    = (f.get("email") or "").strip().lower()
     phone    = (f.get("phone") or "").strip()
-    if not all([name, company, position, email, phone]):
-        return jsonify(ok=False, error="missing_fields"), 400
+    if not all([name,company,position,email,phone]): return jsonify(ok=False,error="missing_fields"),400
     with sqlite3.connect(DB_PATH) as con:
         con.row_factory = sqlite3.Row
         cur = con.cursor()
@@ -458,7 +412,7 @@ def create():
             vid = rand_token(); pin = rand_pin()
             cur.execute("""INSERT INTO visitors(id,name,company,position,email,phone,pin,created_at)
                            VALUES(?,?,?,?,?,?,?,?)""",
-                        (vid, name, company, position, email, phone, pin, datetime.utcnow().isoformat()))
+                        (vid,name,company,position,email,phone,pin,datetime.utcnow().isoformat()))
             con.commit()
             rec = dict(id=vid, name=name, company=company, position=position,
                        email=email, phone=phone, pin=pin, created_at=datetime.utcnow().isoformat())
@@ -474,12 +428,9 @@ def qr_png(vid):
         row = cur.fetchone()
         if not row: return "Not found", 404
     bio = make_qr_png(vid, label_name=row["name"])
-    dl = (request.args.get("dl") or "").strip().lower() in ("1","true","yes","download")
-    if dl:
-        try:
-            return send_file(bio, mimetype="image/png", as_attachment=True, download_name=f"{vid}.png")
-        except TypeError:
-            return send_file(bio, mimetype="image/png", as_attachment=True, attachment_filename=f"{vid}.png")
+    if (request.args.get("dl") or "").lower() in ("1","true","yes","download"):
+        try: return send_file(bio, mimetype="image/png", as_attachment=True, download_name=f"{vid}.png")
+        except TypeError: return send_file(bio, mimetype="image/png", as_attachment=True, attachment_filename=f"{vid}.png")
     return send_file(bio, mimetype="image/png")
 
 @app.route("/card/<vid>.png")
@@ -491,10 +442,8 @@ def card_png(vid):
         cur.execute("SELECT name,company,position FROM visitors WHERE id=?", (vid,))
         row = cur.fetchone()
         if not row: return "Not found", 404
-    return send_file(
-        make_badge_png(row["name"], row["company"], row["position"], visitor_id=vid, rotate_ccw=False),
-        mimetype="image/png"
-    )
+    return send_file(make_badge_png(row["name"],row["company"],row["position"],visitor_id=vid,rotate_ccw=False),
+                     mimetype="image/png")
 
 @app.route("/card_landscape/<vid>.png")
 def card_landscape_png(vid):
@@ -505,16 +454,13 @@ def card_landscape_png(vid):
         cur.execute("SELECT name,company,position FROM visitors WHERE id=?", (vid,))
         row = cur.fetchone()
         if not row: return "Not found", 404
-    return send_file(
-        make_badge_png(row["name"], row["company"], row["position"], visitor_id=vid, rotate_ccw=True),
-        mimetype="image/png"
-    )
+    return send_file(make_badge_png(row["name"],row["company"],row["position"],visitor_id=vid,rotate_ccw=True),
+                     mimetype="image/png")
 
 # ---------- Google Forms webhook ----------
-@app.route("/forms/google", methods=["POST", "OPTIONS"])
+@app.route("/forms/google", methods=["POST","OPTIONS"])
 def forms_google():
-    if request.method == "OPTIONS":
-        return corsify(make_response(("", 204)))
+    if request.method == "OPTIONS": return corsify(make_response(("",204)))
 
     incoming_secret = (request.headers.get("X-Secret") or
                        (request.form.get("secret") if request.form else "") or
@@ -524,11 +470,11 @@ def forms_google():
 
     if request.is_json:
         data = request.get_json(silent=True) or {}
-        if "namedValues" in data and isinstance(data["namedValues"], dict):
+        if isinstance(data.get("namedValues"), dict):
             nv = data["namedValues"]
-            def nv_get(key):
-                v = nv.get(key) or nv.get(key.strip()) or []
-                return v[0] if isinstance(v, list) and v else (v if isinstance(v, str) else "")
+            def nv_get(k):
+                v = nv.get(k) or nv.get(k.strip()) or []
+                return v[0] if isinstance(v,list) and v else (v if isinstance(v,str) else "")
             data = {
                 "name":     nv_get("Name")     or nv_get("الاسم"),
                 "company":  nv_get("Company")  or nv_get("الشركة"),
@@ -539,15 +485,15 @@ def forms_google():
     else:
         data = request.form.to_dict(flat=True)
 
-    name     = (pick(data, "name", "Name", "الاسم", "full_name", "Full Name") or "").strip()
-    company  = (pick(data, "company", "Company", "الشركة") or "").strip()
-    position = (pick(data, "position", "Position", "المنصب") or "").strip()
-    email    = (pick(data, "email", "Email", "البريد") or "").strip().lower()
-    phone    = (pick(data, "phone", "Phone", "الهاتف") or "").strip()
+    name     = (pick(data,"name","Name","الاسم","Full Name") or "").strip()
+    company  = (pick(data,"company","Company","الشركة") or "").strip()
+    position = (pick(data,"position","Position","المنصب") or "").strip()
+    email    = (pick(data,"email","Email","البريد") or "").strip().lower()
+    phone    = (pick(data,"phone","Phone","الهاتف") or "").strip()
 
-    if not all([name, company, position, email, phone]):
+    if not all([name,company,position,email,phone]):
         return corsify(jsonify(ok=False, error="missing_fields",
-                               need=["name","company","position","email","phone"])), 400
+                               need=["name","company","position","email","phone"])),400
 
     ensure_db()
     with sqlite3.connect(DB_PATH) as con:
@@ -561,20 +507,20 @@ def forms_google():
             vid = rand_token(); pin = rand_pin()
             cur.execute("""INSERT INTO visitors(id,name,company,position,email,phone,pin,created_at)
                            VALUES(?,?,?,?,?,?,?,?)""",
-                        (vid, name, company, position, email, phone, pin, datetime.utcnow().isoformat()))
+                        (vid,name,company,position,email,phone,pin,datetime.utcnow().isoformat()))
             con.commit()
             rec = dict(id=vid, name=name, company=company, position=position,
                        email=email, phone=phone, pin=pin, created_at=datetime.utcnow().isoformat())
 
-    # جهّز صور QR & Badge
+    # توليد الصور
     qr_buf   = make_qr_png(rec["id"], label_name=rec["name"])
-    card_buf = make_badge_png(rec["name"], rec["company"], rec["position"], visitor_id=rec["id"], rotate_ccw=False)
+    # card_buf = make_badge_png(...)  # لم نعد نرسله لواتساب
 
-    # إرسال واتساب (اختياري)
+    # إرسال واتساب: QR فقط
     wa_result = None
     if WA_PROXY_URL and requests is not None:
         try:
-            files = {"file": ("badge.png", card_buf.getvalue(), "image/png")}
+            files = {"file": ("qr.png", qr_buf.getvalue(), "image/png")}  # <-- نرسل QR
             data  = {"to": rec["phone"], "name": rec["name"]}
             r = requests.post(WA_PROXY_URL, files=files, data=data, timeout=60)
             if r.ok:
@@ -596,11 +542,10 @@ def forms_google():
         card_portrait=f"{base}/card/{rec['id']}.png",
         card_landscape=f"{base}/card_landscape/{rec['id']}.png"
     )
-    if wa_result is not None:
-        out["whatsapp"] = {"mode": "proxy", **wa_result}
+    if wa_result is not None: out["whatsapp"] = {"mode":"proxy", **wa_result}
     return corsify(jsonify(out))
 
-# ---- Decode helpers (تبقى كما هي) ----
+# ---- Decode endpoints تبقى كما هي ----
 @app.route("/decode_badge", methods=["GET"])
 @app.route("/decode_badge/", methods=["GET"])
 @app.route("/decode_badge/<path:_extra>", methods=["GET"])
@@ -620,79 +565,49 @@ def decode_badge_form(_extra=""):
 @app.route("/decode_badge/", methods=["POST"])
 @app.route("/decode_badge/<path:_extra>", methods=["POST"])
 def decode_badge(_extra=""):
-    lt_q = (request.args.get("landscape_trick") or "").strip().lower()
-    lt_f = (request.form.get("landscape_trick") or "").strip().lower()
-    landscape_trick = True
-    if lt_q in ("0","false","no"): landscape_trick = False
-    if lt_f in ("0","false","no"): landscape_trick = False
-
-    img = None
-    for field in ("image", "file", "photo", "frame", "upload"):
+    lt_q = (request.args.get("landscape_trick") or "").lower()
+    lt_f = (request.form.get("landscape_trick") or "").lower()
+    landscape_trick = not (lt_q in ("0","false","no") or lt_f in ("0","false","no"))
+    img=None
+    for field in ("image","file","photo","frame","upload"):
         if field in request.files:
-            arr = np.frombuffer(request.files[field].read(), np.uint8)
-            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            break
-    if img is None and request.data and request.content_type and (
-        "image/" in request.content_type or "application/octet-stream" in request.content_type):
-        arr = np.frombuffer(request.data, np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            arr=np.frombuffer(request.files[field].read(),np.uint8)
+            img=cv2.imdecode(arr,cv2.IMREAD_COLOR); break
+    if img is None and request.data and request.content_type and ("image/" in request.content_type or "application/octet-stream" in request.content_type):
+        arr=np.frombuffer(request.data,np.uint8); img=cv2.imdecode(arr,cv2.IMREAD_COLOR)
     if img is None and request.is_json:
-        data = request.get_json(silent=True) or {}
-        b64 = (data.get("image_b64") or data.get("image") or "").strip()
+        data=request.get_json(silent=True) or {}; b64=(data.get("image_b64") or data.get("image") or "").strip()
         if b64:
-            if "," in b64: b64 = b64.split(",", 1)[-1]
+            if "," in b64: b64=b64.split(",",1)[-1]
             try:
-                arr = np.frombuffer(base64.b64decode(b64), np.uint8)
-                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            except Exception:
-                img = None
-    if img is None:
-        return jsonify(ok=False, error="no_image_supplied"), 400
-
-    vid, _ = robust_decode(img)
-    if not vid:
-        return jsonify(ok=False, error="decode_failed"), 404
-
+                arr=np.frombuffer(base64.b64decode(b64),np.uint8); img=cv2.imdecode(arr,cv2.IMREAD_COLOR)
+            except Exception: img=None
+    if img is None: return jsonify(ok=False,error="no_image_supplied"),400
+    vid,_=robust_decode(img)
+    if not vid: return jsonify(ok=False,error="decode_failed"),404
     with sqlite3.connect(DB_PATH) as con:
-        con.row_factory = sqlite3.Row
-        cur = con.cursor()
+        con.row_factory=sqlite3.Row; cur=con.cursor()
         cur.execute("SELECT name,company,position FROM visitors WHERE id=?", (vid,))
-        row = cur.fetchone()
-
-    if not row:
-        return jsonify(ok=False, error="unknown_visitor", vid=vid), 404
-
-    return send_file(
-        make_badge_png(row["name"], row["company"], row["position"], visitor_id=vid, rotate_ccw=landscape_trick),
-        mimetype="image/png"
-    )
+        row=cur.fetchone()
+    if not row: return jsonify(ok=False,error="unknown_visitor",vid=vid),404
+    return send_file(make_badge_png(row["name"],row["company"],row["position"],visitor_id=vid,rotate_ccw=landscape_trick),
+                     mimetype="image/png")
 
 @app.route("/decode", methods=["POST"])
 def decode_json():
-    img = None
+    img=None
     if "image" in request.files:
-        arr = np.frombuffer(request.files["image"].read(), np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    elif request.data and request.content_type and (
-        "image/" in request.content_type or "application/octet-stream" in request.content_type):
-        arr = np.frombuffer(request.data, np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        arr=np.frombuffer(request.files["image"].read(),np.uint8); img=cv2.imdecode(arr,cv2.IMREAD_COLOR)
+    elif request.data and request.content_type and ("image/" in request.content_type or "application/octet-stream" in request.content_type):
+        arr=np.frombuffer(request.data,np.uint8); img=cv2.imdecode(arr,cv2.IMREAD_COLOR)
     elif request.is_json:
-        data = request.get_json(silent=True) or {}
-        b64 = (data.get("image_b64") or "").strip()
-        if "," in b64: b64 = b64.split(",", 1)[-1]
+        data=request.get_json(silent=True) or {}; b64=(data.get("image_b64") or "").strip()
+        if "," in b64: b64=b64.split(",",1)[-1]
         if b64:
-            try:
-                arr = np.frombuffer(base64.b64decode(b64), np.uint8)
-                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            except Exception:
-                img = None
-
-    if img is None:
-        return jsonify(ok=False, error="no_image_supplied"), 400
-
-    text, poly = robust_decode(img)
-    return jsonify(ok=bool(text), text=text or "", poly=poly or [])
+            try: arr=np.frombuffer(base64.b64decode(b64),np.uint8); img=cv2.imdecode(arr,cv2.IMREAD_COLOR)
+            except Exception: img=None
+    if img is None: return jsonify(ok=False,error="no_image_supplied"),400
+    text,poly=robust_decode(img); return jsonify(ok=bool(text), text=text or "", poly=poly or [])
 
 # ---------- Main ----------
 if __name__ == "__main__":
