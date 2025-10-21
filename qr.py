@@ -39,6 +39,9 @@ app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024  # 20MB uploads
 
 # ---------- DB helpers ----------
 def ensure_db():
+        db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     with sqlite3.connect(DB_PATH) as con:
         cur = con.cursor()
         cur.execute("""
