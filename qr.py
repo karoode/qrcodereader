@@ -11,9 +11,10 @@ import numpy as np
 from pyzbar import pyzbar
 
 APP_TITLE = "Visitor QR"
-DB_PATH   = os.environ.get("QR_DB", ".venv/visitors.db")
+# استخدم مجلد data الافتراضي (يُنشأ تلقائياً)
+DB_PATH   = os.environ.get("QR_DB", "data/visitors.db")
 
-# Google Forms secret (set in Render → Environment)
+# Google Forms secret (ضبطه من Render → Environment)
 GF_SHARED_SECRET = os.environ.get("GF_SHARED_SECRET", "").strip()
 
 # ---------- Badge & font config ----------
@@ -39,7 +40,8 @@ app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024  # 20MB uploads
 
 # ---------- DB helpers ----------
 def ensure_db():
-        db_dir = os.path.dirname(DB_PATH)
+    # أنشئ المجلد إذا كان المسار يحتوي مجلد
+    db_dir = os.path.dirname(DB_PATH)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
     with sqlite3.connect(DB_PATH) as con:
@@ -136,6 +138,7 @@ def compose_badge_portrait(name, company, position, visitor_id=None, w=BADGE_W, 
     d   = ImageDraw.Draw(img)
     f_label = load_times_bold(FONT_SIZE)
 
+    # Logo أعلى — مرفوع
     safe_top_px   = cm_to_px(HOLE_SAFE_CM)
     logo_shift_px = cm_to_px(LOGO_SHIFT_UP_CM)
     logo_side     = cm_to_px(LOGO_CM)
@@ -157,6 +160,7 @@ def compose_badge_portrait(name, company, position, visitor_id=None, w=BADGE_W, 
         except Exception:
             pass
 
+    # نص يسار + التفاف
     side_pad      = cm_to_px(0.6)
     top_text      = after_logo + cm_to_px(TEXT_TOP_GAP_CM)
     max_text_w    = w - 2*side_pad
@@ -182,6 +186,7 @@ def compose_badge_portrait(name, company, position, visitor_id=None, w=BADGE_W, 
     y += cm_to_px(0.35)
     y += draw_row("Position:", (position or ""), y)
 
+    # QR أسفل البطاقة
     if visitor_id:
         bottom_cm   = float(os.environ.get("BADGE_QR_BOTTOM_CM", "0.8"))
         min_cm      = float(os.environ.get("BADGE_QR_MIN_CM", "1.8"))
@@ -394,8 +399,7 @@ def qr_png(vid):
     return send_file(bio, mimetype="image/png")
 
 # ---------- Google Forms webhook ----------
-# يستقبل JSON أو form-urlencoded من Apps Script. يتحقق من السر.
-# يرجع QR URLs وروابط التحميل.
+# يستقبل JSON من Apps Script ويُرجع روابط QR/Badge
 @app.route("/forms/google", methods=["POST", "OPTIONS"])
 def forms_google():
     if request.method == "OPTIONS":
@@ -412,10 +416,9 @@ def forms_google():
     data = {}
     if request.is_json:
         data = request.get_json(silent=True) or {}
-        # لو جاي بصيغة namedValues
         if "namedValues" in data and isinstance(data["namedValues"], dict):
             nv = data["namedValues"]
-            def nv_get(key): 
+            def nv_get(key):
                 v = nv.get(key) or nv.get(key.strip()) or []
                 return v[0] if isinstance(v, list) and v else (v if isinstance(v, str) else "")
             data = {
@@ -465,9 +468,9 @@ def forms_google():
 
     return corsify(jsonify(ok=True, id=rec["id"], name=rec["name"],
                            qr=qr_url, qr_download=dl_url,
-                           card_portrait=card, card_landscape=card_l))
+                           card_portrait=card, card_landscape=card_l)))
 
-# ---- remaining routes (badge decode, health, etc.) ----
+# ---- remaining routes (badge, health, decode) ----
 @app.route("/card/<vid>.png")
 def card_png(vid):
     ensure_db()
