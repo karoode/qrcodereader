@@ -456,6 +456,19 @@ def card_landscape_png(vid):
         if not row: return "Not found", 404
     return send_file(make_badge_png(row["name"],row["company"],row["position"],visitor_id=vid,rotate_ccw=True),
                      mimetype="image/png")
+# --- Lookup visitor by ID (JSON)
+@app.route("/lookup/<vid>.json")
+def lookup_json(vid):
+    ensure_db()
+    with sqlite3.connect(DB_PATH) as con:
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        cur.execute("SELECT id,name,company,position FROM visitors WHERE id=?", (vid,))
+        row = cur.fetchone()
+        if not row:
+            return jsonify(ok=False, error="not_found"), 404
+        rec = dict(row)
+    return jsonify(ok=True, **rec)
 
 # ---------- Google Forms webhook ----------
 @app.route("/forms/google", methods=["POST","OPTIONS"])
